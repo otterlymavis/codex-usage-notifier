@@ -1,0 +1,18 @@
+{
+  "name": "codex-usage-notifier",
+  "version": "0.1.0",
+  "description": "Create Windows desktop and optional email reminders for Codex usage refresh times.",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Usage Notifier",
+    "shortDescription": "Remind me when Codex usage refreshes.",
+    "longDescription": "Codex Usage Notifier bundles a small local Python utility and skill instructions for setting reminders from the reset time shown by Codex's usage page or limit banner.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "Set a Codex usage refresh reminder using the reset time Codex shows."
+  }
+}
