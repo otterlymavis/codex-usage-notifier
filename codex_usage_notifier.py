@@ -26,6 +26,7 @@ from typing import Any
 APP_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "CodexUsageNotifier"
 CONFIG_PATH = APP_DIR / "config.json"
 STATE_PATH = APP_DIR / "state.json"
+DEFAULT_TASK_NAME = "CodexUsageNotifier"
 
 
 @dataclass
@@ -189,6 +190,10 @@ def notify_all(config: EmailConfig, reset_at: datetime) -> None:
     send_email(config, subject, body)
 
 
+def powershell_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
 def sleep_until(target: datetime) -> None:
     while True:
         remaining = (target - datetime.now()).total_seconds()
@@ -213,6 +218,55 @@ def command_test(args: argparse.Namespace) -> int:
     print("Sent test notification.")
     if config.enabled:
         print("Email was enabled; attempted to send test email.")
+    return 0
+
+
+def command_notify(args: argparse.Namespace) -> int:
+    config = parse_email_config(load_json(CONFIG_PATH, default_config()))
+    reset_at = parse_reset_time(args) if args.at or args.in_duration else datetime.now()
+    notify_all(config, reset_at)
+    save_json(
+        STATE_PATH,
+        {
+            "reset_at": reset_at.isoformat(timespec="seconds"),
+            "notified_at": datetime.now().isoformat(timespec="seconds"),
+            "mode": "scheduled-task",
+        },
+    )
+    print("Notification sent.")
+    return 0
+
+
+def command_schedule(args: argparse.Namespace) -> int:
+    reset_at = parse_reset_time(args)
+    script_path = Path(__file__).resolve()
+    python_path = Path(sys.executable).resolve()
+    reset_text = reset_at.strftime("%Y-%m-%d %H:%M:%S")
+    task_name = args.task_name
+    task_args = f'"{script_path}" notify --at "{reset_text}"'
+    ps_script = f"""
+$ErrorActionPreference = "Stop"
+$runAt = [datetime]::ParseExact({powershell_quote(reset_text)}, "yyyy-MM-dd HH:mm:ss", $null)
+$action = New-ScheduledTaskAction -Execute {powershell_quote(str(python_path))} -Argument {powershell_quote(task_args)}
+$trigger = New-ScheduledTaskTrigger -Once -At $runAt
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -Compatibility Win8
+$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
+Register-ScheduledTask -TaskName {powershell_quote(task_name)} -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description "Notify when Codex usage should be refreshed." -Force | Out-Null
+"""
+    subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+        check=True,
+    )
+    save_json(
+        STATE_PATH,
+        {
+            "reset_at": reset_at.isoformat(timespec="seconds"),
+            "scheduled_at": datetime.now().isoformat(timespec="seconds"),
+            "task_name": task_name,
+            "mode": "scheduled-task",
+        },
+    )
+    print(f"Scheduled Windows task '{task_name}' for {reset_text}.")
     return 0
 
 
@@ -249,6 +303,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     test_parser = subparsers.add_parser("test", help="Send a test notification.")
     test_parser.set_defaults(func=command_test)
+
+    notify_parser = subparsers.add_parser("notify", help="Send the refresh notification now.")
+    notify_parser.add_argument("--at", help="Reset time to include in the notification.")
+    notify_parser.add_argument("--in", dest="in_duration", help="Reset duration to include in the notification.")
+    notify_parser.set_defaults(func=command_notify)
+
+    schedule_parser = subparsers.add_parser("schedule", help="Create a one-time Windows scheduled task.")
+    schedule_parser.add_argument("--at", help="Reset time, e.g. '2026-05-30 18:30' or '18:30'.")
+    schedule_parser.add_argument("--in", dest="in_duration", help="Reset duration, e.g. '5h' or '4 days 3h'.")
+    schedule_parser.add_argument("--task-name", default=DEFAULT_TASK_NAME, help="Windows scheduled task name.")
+    schedule_parser.set_defaults(func=command_schedule)
 
     watch_parser = subparsers.add_parser("watch", help="Wait until a Codex reset time.")
     watch_parser.add_argument("--at", help="Reset time, e.g. '2026-05-29 18:30' or '18:30'.")

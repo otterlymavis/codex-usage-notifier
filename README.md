@@ -21,16 +21,22 @@ python .\codex_usage_notifier.py test
 When Codex says something like "resets in 5 hours", run:
 
 ```powershell
-python .\codex_usage_notifier.py watch --in "5h"
+python .\codex_usage_notifier.py schedule --in "5h"
 ```
 
 Or use a specific time:
 
 ```powershell
-python .\codex_usage_notifier.py watch --at "2026-05-29 18:30"
+python .\codex_usage_notifier.py schedule --at "2026-05-30 18:30"
 ```
 
-The tool keeps running until the reset time, then shows a Windows desktop notification.
+The `schedule` command creates a one-time Windows scheduled task, so the terminal does not need to stay open.
+
+For a simple foreground timer, you can still use:
+
+```powershell
+python .\codex_usage_notifier.py watch --in "5h"
+```
 
 ## Email
 
@@ -63,7 +69,7 @@ Example email block:
 
 - The reset time comes from Codex's own usage page or limit banner.
 - This version does not scrape your OpenAI account.
-- If your PC sleeps, the notification will fire after it wakes and the script resumes.
+- `schedule` is more reliable than `watch` because Windows owns the reminder.
 
 ## Codex Plugin
 
