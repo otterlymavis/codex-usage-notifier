@@ -13,6 +13,7 @@ import json
 import os
 import re
 import smtplib
+import sqlite3
 import subprocess
 import sys
 import time
@@ -28,6 +29,7 @@ CONFIG_PATH = APP_DIR / "config.json"
 STATE_PATH = APP_DIR / "state.json"
 LOG_PATH = APP_DIR / "notifier.log"
 DEFAULT_TASK_NAME = "CodexUsageNotifier"
+CODEX_LOG_DB = Path.home() / ".codex" / "logs_2.sqlite"
 
 
 @dataclass
@@ -138,6 +140,108 @@ def parse_reset_time(args: argparse.Namespace) -> datetime:
         return now + parse_duration(args.in_duration)
 
     raise ValueError("Provide either --at or --in.")
+
+
+def datetime_from_epoch(value: int | float | None) -> datetime | None:
+    if value is None:
+        return None
+    return datetime.fromtimestamp(float(value))
+
+
+def extract_json_after_marker(text: str, marker: str) -> dict[str, Any] | None:
+    index = text.find(marker)
+    if index < 0:
+        return None
+    candidate = text[index + len(marker) :].strip()
+    decoder = json.JSONDecoder()
+    try:
+        value, _ = decoder.raw_decode(candidate)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def find_latest_codex_usage(log_db: Path = CODEX_LOG_DB, limit: int = 5000) -> dict[str, Any]:
+    if not log_db.exists():
+        raise FileNotFoundError(f"Codex log database was not found: {log_db}")
+
+    con = sqlite3.connect(f"file:{log_db.as_posix()}?mode=ro", uri=True)
+    try:
+        rows = con.execute(
+            """
+            select ts, feedback_log_body
+            from logs
+            where feedback_log_body like '%codex.rate_limits%'
+               or feedback_log_body like '%usage_limit_reached%'
+            order by id desc
+            limit ?
+            """,
+            (limit,),
+        ).fetchall()
+    finally:
+        con.close()
+
+    for ts, body in rows:
+        body = body or ""
+        event = extract_json_after_marker(body, "websocket event:")
+        if event and event.get("type") == "codex.rate_limits":
+            return {
+                "source": "codex.rate_limits",
+                "seen_at": int(ts),
+                "plan_type": event.get("plan_type"),
+                "rate_limits": event.get("rate_limits") or {},
+            }
+
+        if event and event.get("type") == "error":
+            error = event.get("error") or {}
+            headers = event.get("headers") or {}
+            if error.get("type") == "usage_limit_reached":
+                reset_at = error.get("resets_at")
+                return {
+                    "source": "usage_limit_reached",
+                    "seen_at": int(ts),
+                    "plan_type": error.get("plan_type") or headers.get("X-Codex-Plan-Type"),
+                    "rate_limits": {
+                        "allowed": False,
+                        "limit_reached": True,
+                        "primary": {
+                            "used_percent": int(headers.get("X-Codex-Primary-Used-Percent", 100)),
+                            "window_minutes": int(headers.get("X-Codex-Primary-Window-Minutes", 300)),
+                            "reset_after_seconds": error.get("resets_in_seconds"),
+                            "reset_at": reset_at,
+                        },
+                        "secondary": {
+                            "used_percent": int(headers.get("X-Codex-Secondary-Used-Percent", 0)),
+                        },
+                    },
+                }
+
+    raise RuntimeError("No Codex usage events were found in the local Codex app logs.")
+
+
+def format_usage(usage: dict[str, Any]) -> str:
+    rate_limits = usage.get("rate_limits") or {}
+    primary = rate_limits.get("primary") or {}
+    secondary = rate_limits.get("secondary") or {}
+    reset_at = datetime_from_epoch(primary.get("reset_at"))
+    weekly_reset_at = datetime_from_epoch(secondary.get("reset_at"))
+    lines = [
+        f"Source: {usage.get('source')}",
+        f"Plan: {usage.get('plan_type') or 'unknown'}",
+        f"Allowed: {rate_limits.get('allowed')}",
+        f"Limit reached: {rate_limits.get('limit_reached')}",
+        f"5-hour usage: {primary.get('used_percent', 'unknown')}%",
+    ]
+    if reset_at:
+        lines.append(f"5-hour reset: {reset_at.strftime('%Y-%m-%d %H:%M:%S')}")
+    if secondary:
+        lines.append(f"Weekly usage: {secondary.get('used_percent', 'unknown')}%")
+    if weekly_reset_at:
+        lines.append(f"Weekly reset: {weekly_reset_at.strftime('%Y-%m-%d %H:%M:%S')}")
+    seen_at = datetime_from_epoch(usage.get("seen_at"))
+    if seen_at:
+        lines.append(f"Last app usage event: {seen_at.strftime('%Y-%m-%d %H:%M:%S')}")
+    return "\n".join(lines)
 
 
 def desktop_notify(title: str, message: str) -> None:
@@ -286,6 +390,31 @@ $info | Select-Object LastRunTime,LastTaskResult,NextRunTime,NumberOfMissedRuns 
     return 0
 
 
+def command_usage(args: argparse.Namespace) -> int:
+    usage = find_latest_codex_usage(Path(args.log_db) if args.log_db else CODEX_LOG_DB)
+    if args.json:
+        print(json.dumps(usage, indent=2))
+    else:
+        print(format_usage(usage))
+    return 0
+
+
+def command_schedule_from_app(args: argparse.Namespace) -> int:
+    usage = find_latest_codex_usage(Path(args.log_db) if args.log_db else CODEX_LOG_DB)
+    rate_limits = usage.get("rate_limits") or {}
+    primary = rate_limits.get("primary") or {}
+    reset_at = datetime_from_epoch(primary.get("reset_at"))
+    if reset_at is None:
+        raise RuntimeError("The latest Codex app usage event did not include a 5-hour reset time.")
+    if reset_at <= datetime.now():
+        raise RuntimeError("The latest Codex app reset time is already in the past. Use Codex once, then retry.")
+
+    args.at = reset_at.strftime("%Y-%m-%d %H:%M:%S")
+    args.in_duration = None
+    print(format_usage(usage))
+    return command_schedule(args)
+
+
 def command_notify(args: argparse.Namespace) -> int:
     config = parse_email_config(load_json(CONFIG_PATH, default_config()))
     reset_at = parse_reset_time(args) if args.at or args.in_duration else datetime.now()
@@ -377,6 +506,19 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser = subparsers.add_parser("status", help="Show scheduled task and notifier state.")
     status_parser.add_argument("--task-name", default=DEFAULT_TASK_NAME, help="Windows scheduled task name.")
     status_parser.set_defaults(func=command_status)
+
+    usage_parser = subparsers.add_parser("usage", help="Read latest Codex usage from local Codex app logs.")
+    usage_parser.add_argument("--json", action="store_true", help="Print raw parsed usage JSON.")
+    usage_parser.add_argument("--log-db", help="Path to Codex logs_2.sqlite.")
+    usage_parser.set_defaults(func=command_usage)
+
+    schedule_from_app_parser = subparsers.add_parser(
+        "schedule-from-app",
+        help="Read latest Codex app usage and schedule the 5-hour reset reminder.",
+    )
+    schedule_from_app_parser.add_argument("--task-name", default=DEFAULT_TASK_NAME, help="Windows scheduled task name.")
+    schedule_from_app_parser.add_argument("--log-db", help="Path to Codex logs_2.sqlite.")
+    schedule_from_app_parser.set_defaults(func=command_schedule_from_app)
 
     notify_parser = subparsers.add_parser("notify", help="Send the refresh notification now.")
     notify_parser.add_argument("--at", help="Reset time to include in the notification.")

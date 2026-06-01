@@ -18,7 +18,19 @@ Send a test desktop notification:
 python .\codex_usage_notifier.py test
 ```
 
-When Codex says something like "resets in 5 hours", run:
+Read the latest Codex app usage cached in local Codex logs:
+
+```powershell
+python .\codex_usage_notifier.py usage
+```
+
+Schedule a reminder from the reset time reported by the Codex app:
+
+```powershell
+python .\codex_usage_notifier.py schedule-from-app
+```
+
+If you want to enter the reset manually, run:
 
 ```powershell
 python .\codex_usage_notifier.py schedule --in "5h"
@@ -74,7 +86,8 @@ Example email block:
 ## Notes
 
 - The reset time comes from Codex's own usage page or limit banner.
-- This version does not scrape your OpenAI account.
+- `usage` and `schedule-from-app` read Codex's local app logs, not your OpenAI auth file.
+- This version does not scrape your OpenAI account or browser session.
 - `schedule` is more reliable than `watch` because Windows owns the reminder.
 - Scheduled reminders are allowed to run on battery power.
 - Notification attempts and task state are logged in `%LOCALAPPDATA%\CodexUsageNotifier\notifier.log`.
