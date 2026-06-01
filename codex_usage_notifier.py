@@ -26,6 +26,7 @@ from typing import Any
 APP_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "CodexUsageNotifier"
 CONFIG_PATH = APP_DIR / "config.json"
 STATE_PATH = APP_DIR / "state.json"
+LOG_PATH = APP_DIR / "notifier.log"
 DEFAULT_TASK_NAME = "CodexUsageNotifier"
 
 
@@ -53,6 +54,13 @@ def save_json(path: Path, data: dict[str, Any]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=2)
         handle.write("\n")
+
+
+def log_event(message: str) -> None:
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().isoformat(timespec="seconds")
+    with LOG_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(f"{stamp} {message}\n")
 
 
 def default_config() -> dict[str, Any]:
@@ -146,14 +154,33 @@ Start-Sleep -Seconds 11
 $notify.Dispose()
 """
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        log_event(f"tray_notification_exit={result.returncode}")
     except OSError:
+        log_event("tray_notification_failed=oserror")
         print(f"{title}: {message}")
+
+
+def popup_notify(title: str, message: str) -> None:
+    script = f"""
+$shell = New-Object -ComObject WScript.Shell
+$null = $shell.Popup({json.dumps(message)}, 30, {json.dumps(title)}, 64)
+"""
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        log_event(f"popup_notification_exit={result.returncode}")
+    except OSError:
+        log_event("popup_notification_failed=oserror")
 
 
 def send_email(config: EmailConfig, subject: str, body: str) -> None:
@@ -178,6 +205,7 @@ def send_email(config: EmailConfig, subject: str, body: str) -> None:
             smtp.starttls()
         smtp.login(config.smtp_user, config.smtp_password)
         smtp.send_message(message)
+    log_event("email_sent")
 
 
 def notify_all(config: EmailConfig, reset_at: datetime) -> None:
@@ -186,8 +214,11 @@ def notify_all(config: EmailConfig, reset_at: datetime) -> None:
         "Codex usage should be refreshed now.\n\n"
         f"Reset time: {reset_at.strftime('%Y-%m-%d %H:%M:%S')}\n"
     )
+    log_event(f"notify_start reset_at={reset_at.isoformat(timespec='seconds')}")
     desktop_notify(subject, "Your Codex usage reset time has arrived.")
+    popup_notify(subject, "Your Codex usage reset time has arrived.")
     send_email(config, subject, body)
+    log_event("notify_complete")
 
 
 def powershell_quote(value: str) -> str:
@@ -207,6 +238,7 @@ def command_init(_: argparse.Namespace) -> int:
         print(f"Config already exists: {CONFIG_PATH}")
         return 0
     save_json(CONFIG_PATH, default_config())
+    log_event("config_created")
     print(f"Created config: {CONFIG_PATH}")
     return 0
 
@@ -218,6 +250,39 @@ def command_test(args: argparse.Namespace) -> int:
     print("Sent test notification.")
     if config.enabled:
         print("Email was enabled; attempted to send test email.")
+    return 0
+
+
+def command_status(args: argparse.Namespace) -> int:
+    task_name = args.task_name
+    print(f"Config: {CONFIG_PATH}")
+    print(f"State:  {STATE_PATH}")
+    print(f"Log:    {LOG_PATH}")
+
+    if STATE_PATH.exists():
+        print("\nState:")
+        print(STATE_PATH.read_text(encoding="utf-8").rstrip())
+
+    ps_script = f"""
+$task = Get-ScheduledTask -TaskName {powershell_quote(task_name)} -ErrorAction SilentlyContinue
+if ($null -eq $task) {{
+  Write-Output "Scheduled task '{task_name}' was not found."
+  exit 0
+}}
+$info = Get-ScheduledTaskInfo -TaskName {powershell_quote(task_name)}
+$task | Select-Object TaskName,TaskPath,State | Format-List
+$info | Select-Object LastRunTime,LastTaskResult,NextRunTime,NumberOfMissedRuns | Format-List
+"""
+    subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+        check=False,
+    )
+
+    if LOG_PATH.exists():
+        print("\nRecent log:")
+        lines = LOG_PATH.read_text(encoding="utf-8").splitlines()[-20:]
+        for line in lines:
+            print(line)
     return 0
 
 
@@ -233,6 +298,7 @@ def command_notify(args: argparse.Namespace) -> int:
             "mode": "scheduled-task",
         },
     )
+    log_event("notify_command_completed")
     print("Notification sent.")
     return 0
 
@@ -249,7 +315,7 @@ $ErrorActionPreference = "Stop"
 $runAt = [datetime]::ParseExact({powershell_quote(reset_text)}, "yyyy-MM-dd HH:mm:ss", $null)
 $action = New-ScheduledTaskAction -Execute {powershell_quote(str(python_path))} -Argument {powershell_quote(task_args)}
 $trigger = New-ScheduledTaskTrigger -Once -At $runAt
-$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -Compatibility Win8
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Compatibility Win8
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 Register-ScheduledTask -TaskName {powershell_quote(task_name)} -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description "Notify when Codex usage should be refreshed." -Force | Out-Null
 """
@@ -266,7 +332,9 @@ Register-ScheduledTask -TaskName {powershell_quote(task_name)} -Action $action -
             "mode": "scheduled-task",
         },
     )
+    log_event(f"scheduled task_name={task_name} reset_at={reset_at.isoformat(timespec='seconds')}")
     print(f"Scheduled Windows task '{task_name}' for {reset_text}.")
+    print("Check it with: python codex_usage_notifier.py status")
     return 0
 
 
@@ -281,6 +349,7 @@ def command_watch(args: argparse.Namespace) -> int:
         },
     )
     print(f"Watching Codex reset time: {reset_at.strftime('%Y-%m-%d %H:%M:%S')}")
+    log_event(f"watch_started reset_at={reset_at.isoformat(timespec='seconds')}")
     sleep_until(reset_at)
     notify_all(config, reset_at)
     save_json(
@@ -290,6 +359,7 @@ def command_watch(args: argparse.Namespace) -> int:
             "notified_at": datetime.now().isoformat(timespec="seconds"),
         },
     )
+    log_event("watch_notification_completed")
     print("Notification sent.")
     return 0
 
@@ -303,6 +373,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     test_parser = subparsers.add_parser("test", help="Send a test notification.")
     test_parser.set_defaults(func=command_test)
+
+    status_parser = subparsers.add_parser("status", help="Show scheduled task and notifier state.")
+    status_parser.add_argument("--task-name", default=DEFAULT_TASK_NAME, help="Windows scheduled task name.")
+    status_parser.set_defaults(func=command_status)
 
     notify_parser = subparsers.add_parser("notify", help="Send the refresh notification now.")
     notify_parser.add_argument("--at", help="Reset time to include in the notification.")

@@ -32,6 +32,12 @@ python .\codex_usage_notifier.py schedule --at "2026-05-30 18:30"
 
 The `schedule` command creates a one-time Windows scheduled task, so the terminal does not need to stay open.
 
+Check the registered reminder:
+
+```powershell
+python .\codex_usage_notifier.py status
+```
+
 For a simple foreground timer, you can still use:
 
 ```powershell
@@ -70,6 +76,8 @@ Example email block:
 - The reset time comes from Codex's own usage page or limit banner.
 - This version does not scrape your OpenAI account.
 - `schedule` is more reliable than `watch` because Windows owns the reminder.
+- Scheduled reminders are allowed to run on battery power.
+- Notification attempts and task state are logged in `%LOCALAPPDATA%\CodexUsageNotifier\notifier.log`.
 
 ## Codex Plugin
 

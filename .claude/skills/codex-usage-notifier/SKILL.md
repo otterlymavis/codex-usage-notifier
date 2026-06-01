@@ -37,6 +37,12 @@ python .\scripts\codex_usage_notifier.py init
 python .\scripts\codex_usage_notifier.py test
 ```
 
+5. To check whether the scheduled task exists or ran:
+
+```powershell
+python .\scripts\codex_usage_notifier.py status
+```
+
 ## Email Setup
 
 The config file lives at `%LOCALAPPDATA%\CodexUsageNotifier\config.json`.
@@ -47,4 +53,6 @@ Set `email.enabled` to `true` and fill SMTP settings. For Gmail, use an app pass
 
 - Use `watch` only when the user explicitly wants a foreground timer and can keep the process running.
 - If the PC sleeps, the reminder fires after the machine wakes and the script resumes.
+- Scheduled reminders are allowed to run on battery power.
+- Notification attempts and task state are logged in `%LOCALAPPDATA%\CodexUsageNotifier\notifier.log`.
 - Do not scrape private OpenAI account pages unless the user explicitly requests browser automation and accepts that login/session state may be required.
