@@ -143,6 +143,15 @@ def parse_reset_time(args: argparse.Namespace) -> datetime:
     raise ValueError("Provide either --at or --in.")
 
 
+def parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
 def datetime_from_epoch(value: int | float | None) -> datetime | None:
     if value is None:
         return None
@@ -490,12 +499,30 @@ def command_monitor_once(args: argparse.Namespace) -> int:
 
     current_state = load_json(STATE_PATH, {})
     reset_text = reset_at.isoformat(timespec="seconds")
+    previous_app_reset = parse_iso_datetime(current_state.get("last_app_reset_at"))
+    if previous_app_reset and previous_app_reset != reset_at and previous_app_reset <= datetime.now():
+        config = parse_email_config(load_json(CONFIG_PATH, default_config()))
+        log_event(
+            "monitor_once detected_refresh "
+            f"previous_reset_at={previous_app_reset.isoformat(timespec='seconds')} "
+            f"new_reset_at={reset_text}"
+        )
+        notify_all(config, previous_app_reset)
+
     already_scheduled = (
         current_state.get("task_name") == args.reminder_task_name
         and current_state.get("reset_at") == reset_text
         and current_state.get("mode") == "scheduled-task"
     )
     if already_scheduled:
+        current_state.update(
+            {
+                "last_app_reset_at": reset_text,
+                "last_app_usage_seen_at": seen_at.isoformat(timespec="seconds") if seen_at else None,
+                "last_app_used_percent": primary.get("used_percent"),
+            }
+        )
+        save_json(STATE_PATH, current_state)
         log_event(f"monitor_once skipped=already_scheduled reset_at={reset_text}")
         print(f"Reminder already scheduled for {reset_at.strftime('%Y-%m-%d %H:%M:%S')}.")
         return 0
@@ -506,6 +533,15 @@ def command_monitor_once(args: argparse.Namespace) -> int:
         task_name=args.reminder_task_name,
     )
     result = command_schedule(schedule_args)
+    updated_state = load_json(STATE_PATH, {})
+    updated_state.update(
+        {
+            "last_app_reset_at": reset_text,
+            "last_app_usage_seen_at": seen_at.isoformat(timespec="seconds") if seen_at else None,
+            "last_app_used_percent": primary.get("used_percent"),
+        }
+    )
+    save_json(STATE_PATH, updated_state)
     log_event(
         "monitor_once scheduled "
         f"reset_at={reset_text} "
