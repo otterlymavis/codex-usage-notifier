@@ -9,6 +9,7 @@ limit banner.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -158,6 +159,40 @@ def datetime_from_epoch(value: int | float | None) -> datetime | None:
     return datetime.fromtimestamp(float(value))
 
 
+def mask_email(email: str | None) -> str | None:
+    if not email or "@" not in email:
+        return email
+    local, domain = email.split("@", 1)
+    if len(local) <= 2:
+        masked_local = local[0] + "*"
+    else:
+        masked_local = local[:2] + "***" + local[-1]
+    return f"{masked_local}@{domain}"
+
+
+def account_task_suffix(account_key: str) -> str:
+    return hashlib.sha1(account_key.encode("utf-8")).hexdigest()[:10]
+
+
+def account_label(usage: dict[str, Any]) -> str:
+    email = usage.get("account_email")
+    account_id = usage.get("account_id")
+    if email:
+        return mask_email(str(email)) or str(email)
+    if account_id:
+        return f"account {str(account_id)[:8]}"
+    return str(usage.get("account_key") or "unknown account")
+
+
+def reminder_task_name(base_name: str, usage: dict[str, Any]) -> str:
+    return f"{base_name}_{account_task_suffix(str(usage.get('account_key') or account_label(usage)))}"
+
+
+def extract_thread_id(text: str) -> str | None:
+    match = re.search(r"thread(?:\.id|_id)=([0-9a-f-]+)", text)
+    return match.group(1) if match else None
+
+
 def extract_json_after_marker(text: str, marker: str) -> dict[str, Any] | None:
     index = text.find(marker)
     if index < 0:
@@ -171,45 +206,73 @@ def extract_json_after_marker(text: str, marker: str) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def find_latest_codex_usage(log_db: Path = CODEX_LOG_DB, limit: int = 5000) -> dict[str, Any]:
-    if not log_db.exists():
-        raise FileNotFoundError(f"Codex log database was not found: {log_db}")
+def parse_account_from_log(body: str) -> dict[str, str] | None:
+    thread_id = extract_thread_id(body)
+    account_id_match = re.search(r'user\.account_id="([^"]+)"', body)
+    email_match = re.search(r'user\.email="([^"]+)"', body)
+    if not thread_id or not (account_id_match or email_match):
+        return None
+    account_id = account_id_match.group(1) if account_id_match else ""
+    email = email_match.group(1) if email_match else ""
+    return {
+        "thread_id": thread_id,
+        "account_id": account_id,
+        "account_email": email,
+        "account_key": account_id or email or thread_id,
+    }
 
-    con = sqlite3.connect(f"file:{log_db.as_posix()}?mode=ro", uri=True)
-    try:
-        rows = con.execute(
-            """
-            select ts, feedback_log_body
-            from logs
-            where feedback_log_body like '%codex.rate_limits%'
-               or feedback_log_body like '%usage_limit_reached%'
-            order by id desc
-            limit ?
-            """,
-            (limit,),
-        ).fetchall()
-    finally:
-        con.close()
 
-    for ts, body in rows:
-        body = body or ""
-        event = extract_json_after_marker(body, "websocket event:")
-        if event and event.get("type") == "codex.rate_limits":
-            return {
+def build_thread_account_map(con: sqlite3.Connection, limit: int) -> dict[str, dict[str, str]]:
+    rows = con.execute(
+        """
+        select feedback_log_body
+        from logs
+        where feedback_log_body like '%user.account_id=%'
+           or feedback_log_body like '%user.email=%'
+        order by id desc
+        limit ?
+        """,
+        (limit,),
+    ).fetchall()
+    accounts: dict[str, dict[str, str]] = {}
+    for (body,) in rows:
+        parsed = parse_account_from_log(body or "")
+        if parsed and parsed["thread_id"] not in accounts:
+            accounts[parsed["thread_id"]] = parsed
+    return accounts
+
+
+def usage_from_event(ts: int, body: str, accounts_by_thread: dict[str, dict[str, str]]) -> dict[str, Any] | None:
+    thread_id = extract_thread_id(body)
+    account = accounts_by_thread.get(thread_id or "", {})
+    if not account:
+        return None
+    base = {
+        "seen_at": int(ts),
+        "thread_id": thread_id,
+        "account_id": account.get("account_id"),
+        "account_email": account.get("account_email"),
+        "account_key": account.get("account_key") or thread_id or "unknown",
+    }
+    event = extract_json_after_marker(body, "websocket event:")
+    if event and event.get("type") == "codex.rate_limits":
+        base.update(
+            {
                 "source": "codex.rate_limits",
-                "seen_at": int(ts),
                 "plan_type": event.get("plan_type"),
                 "rate_limits": event.get("rate_limits") or {},
             }
+        )
+        return base
 
-        if event and event.get("type") == "error":
-            error = event.get("error") or {}
-            headers = event.get("headers") or {}
-            if error.get("type") == "usage_limit_reached":
-                reset_at = error.get("resets_at")
-                return {
+    if event and event.get("type") == "error":
+        error = event.get("error") or {}
+        headers = event.get("headers") or {}
+        if error.get("type") == "usage_limit_reached":
+            reset_at = error.get("resets_at")
+            base.update(
+                {
                     "source": "usage_limit_reached",
-                    "seen_at": int(ts),
                     "plan_type": error.get("plan_type") or headers.get("X-Codex-Plan-Type"),
                     "rate_limits": {
                         "allowed": False,
@@ -225,8 +288,50 @@ def find_latest_codex_usage(log_db: Path = CODEX_LOG_DB, limit: int = 5000) -> d
                         },
                     },
                 }
+            )
+            return base
+    return None
 
-    raise RuntimeError("No Codex usage events were found in the local Codex app logs.")
+
+def find_latest_codex_usage_by_account(log_db: Path = CODEX_LOG_DB, limit: int = 10000) -> list[dict[str, Any]]:
+    if not log_db.exists():
+        raise FileNotFoundError(f"Codex log database was not found: {log_db}")
+
+    con = sqlite3.connect(f"file:{log_db.as_posix()}?mode=ro", uri=True)
+    try:
+        accounts_by_thread = build_thread_account_map(con, limit)
+        rows = con.execute(
+            """
+            select ts, feedback_log_body
+            from logs
+            where (feedback_log_body like '%websocket event:%codex.rate_limits%'
+               or feedback_log_body like '%websocket event:%usage_limit_reached%')
+              and feedback_log_body not like '%Received message%'
+            order by id desc
+            limit ?
+            """,
+            (limit,),
+        ).fetchall()
+    finally:
+        con.close()
+
+    by_account: dict[str, dict[str, Any]] = {}
+    for ts, body in rows:
+        usage = usage_from_event(int(ts), body or "", accounts_by_thread)
+        if not usage:
+            continue
+        key = str(usage.get("account_key") or usage.get("thread_id") or "unknown")
+        if key not in by_account:
+            by_account[key] = usage
+
+    if not by_account:
+        raise RuntimeError("No Codex usage events were found in the local Codex app logs.")
+    return list(by_account.values())
+
+
+def find_latest_codex_usage(log_db: Path = CODEX_LOG_DB, limit: int = 5000) -> dict[str, Any]:
+    usages = find_latest_codex_usage_by_account(log_db, limit)
+    return max(usages, key=lambda item: int(item.get("seen_at") or 0))
 
 
 def format_usage(usage: dict[str, Any]) -> str:
@@ -236,6 +341,7 @@ def format_usage(usage: dict[str, Any]) -> str:
     reset_at = datetime_from_epoch(primary.get("reset_at"))
     weekly_reset_at = datetime_from_epoch(secondary.get("reset_at"))
     lines = [
+        f"Account: {account_label(usage)}",
         f"Source: {usage.get('source')}",
         f"Plan: {usage.get('plan_type') or 'unknown'}",
         f"Allowed: {rate_limits.get('allowed')}",
@@ -322,15 +428,16 @@ def send_email(config: EmailConfig, subject: str, body: str) -> None:
     log_event("email_sent")
 
 
-def notify_all(config: EmailConfig, reset_at: datetime) -> None:
-    subject = "Codex usage should be refreshed"
+def notify_all(config: EmailConfig, reset_at: datetime, label: str | None = None) -> None:
+    suffix = f" for {label}" if label else ""
+    subject = f"Codex usage should be refreshed{suffix}"
     body = (
-        "Codex usage should be refreshed now.\n\n"
+        f"Codex usage should be refreshed now{suffix}.\n\n"
         f"Reset time: {reset_at.strftime('%Y-%m-%d %H:%M:%S')}\n"
     )
-    log_event(f"notify_start reset_at={reset_at.isoformat(timespec='seconds')}")
-    desktop_notify(subject, "Your Codex usage reset time has arrived.")
-    popup_notify(subject, "Your Codex usage reset time has arrived.")
+    log_event(f"notify_start reset_at={reset_at.isoformat(timespec='seconds')} account={label or 'unknown'}")
+    desktop_notify(subject, f"Your Codex usage reset time has arrived{suffix}.")
+    popup_notify(subject, f"Your Codex usage reset time has arrived{suffix}.")
     send_email(config, subject, body)
     log_event("notify_complete")
 
@@ -360,7 +467,7 @@ def command_init(_: argparse.Namespace) -> int:
 def command_test(args: argparse.Namespace) -> int:
     config = parse_email_config(load_json(CONFIG_PATH, default_config()))
     reset_at = datetime.now()
-    notify_all(config, reset_at)
+    notify_all(config, reset_at, args.account_label)
     print("Sent test notification.")
     if config.enabled:
         print("Email was enabled; attempted to send test email.")
@@ -406,7 +513,16 @@ def command_monitor_status(args: argparse.Namespace) -> int:
 
 
 def command_usage(args: argparse.Namespace) -> int:
-    usage = find_latest_codex_usage(Path(args.log_db) if args.log_db else CODEX_LOG_DB)
+    log_db = Path(args.log_db) if args.log_db else CODEX_LOG_DB
+    if args.all_accounts:
+        usages = find_latest_codex_usage_by_account(log_db)
+        if args.json:
+            print(json.dumps(usages, indent=2))
+        else:
+            print("\n\n".join(format_usage(usage) for usage in usages))
+        return 0
+
+    usage = find_latest_codex_usage(log_db)
     if args.json:
         print(json.dumps(usage, indent=2))
     else:
@@ -426,6 +542,7 @@ def command_schedule_from_app(args: argparse.Namespace) -> int:
 
     args.at = reset_at.strftime("%Y-%m-%d %H:%M:%S")
     args.in_duration = None
+    args.account_label = account_label(usage)
     print(format_usage(usage))
     return command_schedule(args)
 
@@ -433,13 +550,14 @@ def command_schedule_from_app(args: argparse.Namespace) -> int:
 def command_notify(args: argparse.Namespace) -> int:
     config = parse_email_config(load_json(CONFIG_PATH, default_config()))
     reset_at = parse_reset_time(args) if args.at or args.in_duration else datetime.now()
-    notify_all(config, reset_at)
+    notify_all(config, reset_at, args.account_label)
     save_json(
         STATE_PATH,
         {
             "reset_at": reset_at.isoformat(timespec="seconds"),
             "notified_at": datetime.now().isoformat(timespec="seconds"),
             "mode": "scheduled-task",
+            "account_label": args.account_label,
         },
     )
     log_event("notify_command_completed")
@@ -454,6 +572,8 @@ def command_schedule(args: argparse.Namespace) -> int:
     reset_text = reset_at.strftime("%Y-%m-%d %H:%M:%S")
     task_name = args.task_name
     task_args = f'"{script_path}" notify --at "{reset_text}"'
+    if getattr(args, "account_label", None):
+        task_args += f' --account-label "{args.account_label}"'
     ps_script = f"""
 $ErrorActionPreference = "Stop"
 $runAt = [datetime]::ParseExact({powershell_quote(reset_text)}, "yyyy-MM-dd HH:mm:ss", $null)
@@ -474,6 +594,7 @@ Register-ScheduledTask -TaskName {powershell_quote(task_name)} -Action $action -
             "scheduled_at": datetime.now().isoformat(timespec="seconds"),
             "task_name": task_name,
             "mode": "scheduled-task",
+            "account_label": getattr(args, "account_label", None),
         },
     )
     log_event(f"scheduled task_name={task_name} reset_at={reset_at.isoformat(timespec='seconds')}")
@@ -482,60 +603,72 @@ Register-ScheduledTask -TaskName {powershell_quote(task_name)} -Action $action -
     return 0
 
 
-def command_monitor_once(args: argparse.Namespace) -> int:
-    usage = find_latest_codex_usage(Path(args.log_db) if args.log_db else CODEX_LOG_DB)
+def monitor_single_usage(usage: dict[str, Any], args: argparse.Namespace) -> int:
     rate_limits = usage.get("rate_limits") or {}
     primary = rate_limits.get("primary") or {}
     reset_at = datetime_from_epoch(primary.get("reset_at"))
     seen_at = datetime_from_epoch(usage.get("seen_at"))
+    label = account_label(usage)
+    task_name = reminder_task_name(args.reminder_task_name, usage) if args.all_accounts else args.reminder_task_name
     if reset_at is None:
-        log_event("monitor_once skipped=no_primary_reset")
-        print("Latest Codex usage did not include a 5-hour reset time.")
+        log_event(f"monitor_once skipped=no_primary_reset account={label}")
+        print(f"Latest Codex usage did not include a 5-hour reset time for {label}.")
         return 0
     if reset_at <= datetime.now():
-        log_event(f"monitor_once skipped=past_reset reset_at={reset_at.isoformat(timespec='seconds')}")
-        print(f"Latest Codex reset is in the past: {reset_at.strftime('%Y-%m-%d %H:%M:%S')}")
+        log_event(f"monitor_once skipped=past_reset account={label} reset_at={reset_at.isoformat(timespec='seconds')}")
+        print(f"Latest Codex reset is in the past for {label}: {reset_at.strftime('%Y-%m-%d %H:%M:%S')}")
         return 0
 
     current_state = load_json(STATE_PATH, {})
+    accounts_state = current_state.setdefault("accounts", {})
+    account_state = accounts_state.setdefault(str(usage.get("account_key") or label), {})
     reset_text = reset_at.isoformat(timespec="seconds")
-    previous_app_reset = parse_iso_datetime(current_state.get("last_app_reset_at"))
+    previous_app_reset = parse_iso_datetime(account_state.get("last_app_reset_at"))
     if previous_app_reset and previous_app_reset != reset_at and previous_app_reset <= datetime.now():
         config = parse_email_config(load_json(CONFIG_PATH, default_config()))
         log_event(
             "monitor_once detected_refresh "
+            f"account={label} "
             f"previous_reset_at={previous_app_reset.isoformat(timespec='seconds')} "
             f"new_reset_at={reset_text}"
         )
-        notify_all(config, previous_app_reset)
+        notify_all(config, previous_app_reset, label)
 
     already_scheduled = (
-        current_state.get("task_name") == args.reminder_task_name
-        and current_state.get("reset_at") == reset_text
-        and current_state.get("mode") == "scheduled-task"
+        account_state.get("task_name") == task_name
+        and account_state.get("reset_at") == reset_text
     )
     if already_scheduled:
-        current_state.update(
+        account_state.update(
             {
                 "last_app_reset_at": reset_text,
                 "last_app_usage_seen_at": seen_at.isoformat(timespec="seconds") if seen_at else None,
                 "last_app_used_percent": primary.get("used_percent"),
+                "account_label": label,
             }
         )
         save_json(STATE_PATH, current_state)
-        log_event(f"monitor_once skipped=already_scheduled reset_at={reset_text}")
-        print(f"Reminder already scheduled for {reset_at.strftime('%Y-%m-%d %H:%M:%S')}.")
+        log_event(f"monitor_once skipped=already_scheduled account={label} reset_at={reset_text}")
+        print(f"Reminder already scheduled for {label} at {reset_at.strftime('%Y-%m-%d %H:%M:%S')}.")
         return 0
 
     schedule_args = argparse.Namespace(
         at=reset_at.strftime("%Y-%m-%d %H:%M:%S"),
         in_duration=None,
-        task_name=args.reminder_task_name,
+        task_name=task_name,
+        account_label=label,
     )
     result = command_schedule(schedule_args)
     updated_state = load_json(STATE_PATH, {})
-    updated_state.update(
+    updated_accounts = updated_state.setdefault("accounts", {})
+    updated_account = updated_accounts.setdefault(str(usage.get("account_key") or label), {})
+    updated_account.update(
         {
+            "reset_at": reset_text,
+            "scheduled_at": datetime.now().isoformat(timespec="seconds"),
+            "task_name": task_name,
+            "mode": "scheduled-task",
+            "account_label": label,
             "last_app_reset_at": reset_text,
             "last_app_usage_seen_at": seen_at.isoformat(timespec="seconds") if seen_at else None,
             "last_app_used_percent": primary.get("used_percent"),
@@ -544,10 +677,21 @@ def command_monitor_once(args: argparse.Namespace) -> int:
     save_json(STATE_PATH, updated_state)
     log_event(
         "monitor_once scheduled "
+        f"account={label} "
+        f"task_name={task_name} "
         f"reset_at={reset_text} "
         f"usage_seen_at={seen_at.isoformat(timespec='seconds') if seen_at else 'unknown'} "
         f"used_percent={primary.get('used_percent', 'unknown')}"
     )
+    return result
+
+
+def command_monitor_once(args: argparse.Namespace) -> int:
+    log_db = Path(args.log_db) if args.log_db else CODEX_LOG_DB
+    usages = find_latest_codex_usage_by_account(log_db) if args.all_accounts else [find_latest_codex_usage(log_db)]
+    result = 0
+    for usage in usages:
+        result = max(result, monitor_single_usage(usage, args))
     return result
 
 
@@ -560,6 +704,8 @@ def command_install_monitor(args: argparse.Namespace) -> int:
         f'"{script_path}" monitor-once '
         f'--reminder-task-name "{args.reminder_task_name}"'
     )
+    if args.all_accounts:
+        task_args += " --all-accounts"
     if args.log_db:
         task_args += f' --log-db "{args.log_db}"'
 
@@ -580,6 +726,7 @@ Register-ScheduledTask -TaskName {powershell_quote(task_name)} -Action $action -
     monitor_args = argparse.Namespace(
         log_db=args.log_db,
         reminder_task_name=args.reminder_task_name,
+        all_accounts=args.all_accounts,
     )
     return command_monitor_once(monitor_args)
 
@@ -636,6 +783,7 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.set_defaults(func=command_init)
 
     test_parser = subparsers.add_parser("test", help="Send a test notification.")
+    test_parser.add_argument("--account-label", help="Optional account label to include in the test.")
     test_parser.set_defaults(func=command_test)
 
     status_parser = subparsers.add_parser("status", help="Show scheduled task and notifier state.")
@@ -648,6 +796,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     usage_parser = subparsers.add_parser("usage", help="Read latest Codex usage from local Codex app logs.")
     usage_parser.add_argument("--json", action="store_true", help="Print raw parsed usage JSON.")
+    usage_parser.add_argument("--all-accounts", action="store_true", help="Print latest usage for every account found in Codex logs.")
     usage_parser.add_argument("--log-db", help="Path to Codex logs_2.sqlite.")
     usage_parser.set_defaults(func=command_usage)
 
@@ -665,6 +814,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     monitor_once_parser.add_argument("--reminder-task-name", default=DEFAULT_TASK_NAME, help="Reminder task name.")
     monitor_once_parser.add_argument("--log-db", help="Path to Codex logs_2.sqlite.")
+    monitor_once_parser.add_argument("--all-accounts", action="store_true", default=True, help="Monitor every account found in Codex logs.")
+    monitor_once_parser.add_argument("--single-account", action="store_false", dest="all_accounts", help="Only monitor the latest account overall.")
     monitor_once_parser.set_defaults(func=command_monitor_once)
 
     install_monitor_parser = subparsers.add_parser(
@@ -675,6 +826,8 @@ def build_parser() -> argparse.ArgumentParser:
     install_monitor_parser.add_argument("--reminder-task-name", default=DEFAULT_TASK_NAME, help="Reminder task name.")
     install_monitor_parser.add_argument("--interval-minutes", type=int, default=15, help="How often to check Codex usage.")
     install_monitor_parser.add_argument("--log-db", help="Path to Codex logs_2.sqlite.")
+    install_monitor_parser.add_argument("--all-accounts", action="store_true", default=True, help="Monitor every account found in Codex logs.")
+    install_monitor_parser.add_argument("--single-account", action="store_false", dest="all_accounts", help="Only monitor the latest account overall.")
     install_monitor_parser.set_defaults(func=command_install_monitor)
 
     uninstall_monitor_parser = subparsers.add_parser(
@@ -688,12 +841,14 @@ def build_parser() -> argparse.ArgumentParser:
     notify_parser = subparsers.add_parser("notify", help="Send the refresh notification now.")
     notify_parser.add_argument("--at", help="Reset time to include in the notification.")
     notify_parser.add_argument("--in", dest="in_duration", help="Reset duration to include in the notification.")
+    notify_parser.add_argument("--account-label", help="Optional account label to include in the notification.")
     notify_parser.set_defaults(func=command_notify)
 
     schedule_parser = subparsers.add_parser("schedule", help="Create a one-time Windows scheduled task.")
     schedule_parser.add_argument("--at", help="Reset time, e.g. '2026-05-30 18:30' or '18:30'.")
     schedule_parser.add_argument("--in", dest="in_duration", help="Reset duration, e.g. '5h' or '4 days 3h'.")
     schedule_parser.add_argument("--task-name", default=DEFAULT_TASK_NAME, help="Windows scheduled task name.")
+    schedule_parser.add_argument("--account-label", help="Optional account label to include in the notification.")
     schedule_parser.set_defaults(func=command_schedule)
 
     watch_parser = subparsers.add_parser("watch", help="Wait until a Codex reset time.")
