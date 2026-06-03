@@ -3,6 +3,3 @@ __pycache__/
 .venv/
 venv/
 *.log
-AGENT.md
-CLAUDE.md
-GEMINI.md
