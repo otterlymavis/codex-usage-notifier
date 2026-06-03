@@ -24,7 +24,21 @@ Read the latest Codex app usage cached in local Codex logs:
 python .\codex_usage_notifier.py usage
 ```
 
-Schedule a reminder from the reset time reported by the Codex app:
+Install the background monitor. This is the recommended setup:
+
+```powershell
+python .\codex_usage_notifier.py install-monitor
+```
+
+The monitor checks the Codex app logs every 15 minutes and keeps the refresh reminder scheduled from the latest app-reported reset time.
+
+Check the monitor:
+
+```powershell
+python .\codex_usage_notifier.py monitor-status
+```
+
+Schedule a one-off reminder from the reset time reported by the Codex app:
 
 ```powershell
 python .\codex_usage_notifier.py schedule-from-app
@@ -88,6 +102,7 @@ Example email block:
 - The reset time comes from Codex's own usage page or limit banner.
 - `usage` and `schedule-from-app` read Codex's local app logs, not your OpenAI auth file.
 - This version does not scrape your OpenAI account or browser session.
+- `install-monitor` is needed if you want the tool to keep working automatically in the background.
 - `schedule` is more reliable than `watch` because Windows owns the reminder.
 - Scheduled reminders are allowed to run on battery power.
 - Notification attempts and task state are logged in `%LOCALAPPDATA%\CodexUsageNotifier\notifier.log`.

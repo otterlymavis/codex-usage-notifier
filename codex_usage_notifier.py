@@ -29,6 +29,7 @@ CONFIG_PATH = APP_DIR / "config.json"
 STATE_PATH = APP_DIR / "state.json"
 LOG_PATH = APP_DIR / "notifier.log"
 DEFAULT_TASK_NAME = "CodexUsageNotifier"
+DEFAULT_MONITOR_TASK_NAME = "CodexUsageNotifierMonitor"
 CODEX_LOG_DB = Path.home() / ".codex" / "logs_2.sqlite"
 
 
@@ -390,6 +391,11 @@ $info | Select-Object LastRunTime,LastTaskResult,NextRunTime,NumberOfMissedRuns 
     return 0
 
 
+def command_monitor_status(args: argparse.Namespace) -> int:
+    args.task_name = args.task_name or DEFAULT_MONITOR_TASK_NAME
+    return command_status(args)
+
+
 def command_usage(args: argparse.Namespace) -> int:
     usage = find_latest_codex_usage(Path(args.log_db) if args.log_db else CODEX_LOG_DB)
     if args.json:
@@ -467,6 +473,99 @@ Register-ScheduledTask -TaskName {powershell_quote(task_name)} -Action $action -
     return 0
 
 
+def command_monitor_once(args: argparse.Namespace) -> int:
+    usage = find_latest_codex_usage(Path(args.log_db) if args.log_db else CODEX_LOG_DB)
+    rate_limits = usage.get("rate_limits") or {}
+    primary = rate_limits.get("primary") or {}
+    reset_at = datetime_from_epoch(primary.get("reset_at"))
+    seen_at = datetime_from_epoch(usage.get("seen_at"))
+    if reset_at is None:
+        log_event("monitor_once skipped=no_primary_reset")
+        print("Latest Codex usage did not include a 5-hour reset time.")
+        return 0
+    if reset_at <= datetime.now():
+        log_event(f"monitor_once skipped=past_reset reset_at={reset_at.isoformat(timespec='seconds')}")
+        print(f"Latest Codex reset is in the past: {reset_at.strftime('%Y-%m-%d %H:%M:%S')}")
+        return 0
+
+    current_state = load_json(STATE_PATH, {})
+    reset_text = reset_at.isoformat(timespec="seconds")
+    already_scheduled = (
+        current_state.get("task_name") == args.reminder_task_name
+        and current_state.get("reset_at") == reset_text
+        and current_state.get("mode") == "scheduled-task"
+    )
+    if already_scheduled:
+        log_event(f"monitor_once skipped=already_scheduled reset_at={reset_text}")
+        print(f"Reminder already scheduled for {reset_at.strftime('%Y-%m-%d %H:%M:%S')}.")
+        return 0
+
+    schedule_args = argparse.Namespace(
+        at=reset_at.strftime("%Y-%m-%d %H:%M:%S"),
+        in_duration=None,
+        task_name=args.reminder_task_name,
+    )
+    result = command_schedule(schedule_args)
+    log_event(
+        "monitor_once scheduled "
+        f"reset_at={reset_text} "
+        f"usage_seen_at={seen_at.isoformat(timespec='seconds') if seen_at else 'unknown'} "
+        f"used_percent={primary.get('used_percent', 'unknown')}"
+    )
+    return result
+
+
+def command_install_monitor(args: argparse.Namespace) -> int:
+    script_path = Path(__file__).resolve()
+    python_path = Path(sys.executable).resolve()
+    task_name = args.task_name
+    interval = max(1, int(args.interval_minutes))
+    task_args = (
+        f'"{script_path}" monitor-once '
+        f'--reminder-task-name "{args.reminder_task_name}"'
+    )
+    if args.log_db:
+        task_args += f' --log-db "{args.log_db}"'
+
+    ps_script = f"""
+$ErrorActionPreference = "Stop"
+$action = New-ScheduledTaskAction -Execute {powershell_quote(str(python_path))} -Argument {powershell_quote(task_args)}
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes {interval}) -RepetitionDuration (New-TimeSpan -Days 3650)
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Compatibility Win8
+$principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
+Register-ScheduledTask -TaskName {powershell_quote(task_name)} -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description "Monitor local Codex app usage and schedule refresh notifications." -Force | Out-Null
+"""
+    subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+        check=True,
+    )
+    log_event(f"monitor_installed task_name={task_name} interval_minutes={interval}")
+    print(f"Installed monitor task '{task_name}' to check Codex usage every {interval} minute(s).")
+    monitor_args = argparse.Namespace(
+        log_db=args.log_db,
+        reminder_task_name=args.reminder_task_name,
+    )
+    return command_monitor_once(monitor_args)
+
+
+def command_uninstall_monitor(args: argparse.Namespace) -> int:
+    for task_name in [args.task_name, args.reminder_task_name]:
+        subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                f"Unregister-ScheduledTask -TaskName {powershell_quote(task_name)} -Confirm:$false -ErrorAction SilentlyContinue",
+            ],
+            check=False,
+        )
+        log_event(f"task_uninstalled_if_present task_name={task_name}")
+    print("Removed monitor/reminder tasks if they existed.")
+    return 0
+
+
 def command_watch(args: argparse.Namespace) -> int:
     reset_at = parse_reset_time(args)
     config = parse_email_config(load_json(CONFIG_PATH, default_config()))
@@ -507,6 +606,10 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser.add_argument("--task-name", default=DEFAULT_TASK_NAME, help="Windows scheduled task name.")
     status_parser.set_defaults(func=command_status)
 
+    monitor_status_parser = subparsers.add_parser("monitor-status", help="Show background monitor task state.")
+    monitor_status_parser.add_argument("--task-name", default=DEFAULT_MONITOR_TASK_NAME, help="Windows monitor task name.")
+    monitor_status_parser.set_defaults(func=command_monitor_status)
+
     usage_parser = subparsers.add_parser("usage", help="Read latest Codex usage from local Codex app logs.")
     usage_parser.add_argument("--json", action="store_true", help="Print raw parsed usage JSON.")
     usage_parser.add_argument("--log-db", help="Path to Codex logs_2.sqlite.")
@@ -519,6 +622,32 @@ def build_parser() -> argparse.ArgumentParser:
     schedule_from_app_parser.add_argument("--task-name", default=DEFAULT_TASK_NAME, help="Windows scheduled task name.")
     schedule_from_app_parser.add_argument("--log-db", help="Path to Codex logs_2.sqlite.")
     schedule_from_app_parser.set_defaults(func=command_schedule_from_app)
+
+    monitor_once_parser = subparsers.add_parser(
+        "monitor-once",
+        help="Read Codex app usage once and schedule a reminder if needed.",
+    )
+    monitor_once_parser.add_argument("--reminder-task-name", default=DEFAULT_TASK_NAME, help="Reminder task name.")
+    monitor_once_parser.add_argument("--log-db", help="Path to Codex logs_2.sqlite.")
+    monitor_once_parser.set_defaults(func=command_monitor_once)
+
+    install_monitor_parser = subparsers.add_parser(
+        "install-monitor",
+        help="Install a recurring Windows task that monitors Codex app usage.",
+    )
+    install_monitor_parser.add_argument("--task-name", default=DEFAULT_MONITOR_TASK_NAME, help="Windows monitor task name.")
+    install_monitor_parser.add_argument("--reminder-task-name", default=DEFAULT_TASK_NAME, help="Reminder task name.")
+    install_monitor_parser.add_argument("--interval-minutes", type=int, default=15, help="How often to check Codex usage.")
+    install_monitor_parser.add_argument("--log-db", help="Path to Codex logs_2.sqlite.")
+    install_monitor_parser.set_defaults(func=command_install_monitor)
+
+    uninstall_monitor_parser = subparsers.add_parser(
+        "uninstall-monitor",
+        help="Remove monitor and reminder scheduled tasks.",
+    )
+    uninstall_monitor_parser.add_argument("--task-name", default=DEFAULT_MONITOR_TASK_NAME, help="Windows monitor task name.")
+    uninstall_monitor_parser.add_argument("--reminder-task-name", default=DEFAULT_TASK_NAME, help="Reminder task name.")
+    uninstall_monitor_parser.set_defaults(func=command_uninstall_monitor)
 
     notify_parser = subparsers.add_parser("notify", help="Send the refresh notification now.")
     notify_parser.add_argument("--at", help="Reset time to include in the notification.")

@@ -15,13 +15,25 @@ Use the bundled Python script to read Codex's locally cached app usage and set r
 python .\scripts\codex_usage_notifier.py usage
 ```
 
-2. Schedule from the reset time reported by the Codex app:
+2. Install the background monitor when the user wants this to work automatically:
+
+```powershell
+python .\scripts\codex_usage_notifier.py install-monitor
+```
+
+3. Check the monitor:
+
+```powershell
+python .\scripts\codex_usage_notifier.py monitor-status
+```
+
+4. Schedule a one-off reminder from the reset time reported by the Codex app:
 
 ```powershell
 python .\scripts\codex_usage_notifier.py schedule-from-app
 ```
 
-3. If app usage is unavailable or stale, ask for the reset time shown by Codex and use `schedule` manually:
+5. If app usage is unavailable or stale, ask for the reset time shown by Codex and use `schedule` manually:
 
 ```powershell
 python .\scripts\codex_usage_notifier.py schedule --in "5h"
@@ -33,19 +45,19 @@ or:
 python .\scripts\codex_usage_notifier.py schedule --at "2026-05-30 18:30"
 ```
 
-4. For a first-time setup or email configuration, create the config file:
+6. For a first-time setup or email configuration, create the config file:
 
 ```powershell
 python .\scripts\codex_usage_notifier.py init
 ```
 
-5. To verify desktop notification and optional email settings:
+7. To verify desktop notification and optional email settings:
 
 ```powershell
 python .\scripts\codex_usage_notifier.py test
 ```
 
-6. To check whether the scheduled task exists or ran:
+8. To check whether the scheduled reminder task exists or ran:
 
 ```powershell
 python .\scripts\codex_usage_notifier.py status
@@ -61,6 +73,7 @@ Set `email.enabled` to `true` and fill SMTP settings. For Gmail, use an app pass
 
 - Use `watch` only when the user explicitly wants a foreground timer and can keep the process running.
 - `usage` and `schedule-from-app` read Codex's local `logs_2.sqlite`; they do not read `auth.json`.
+- Use `install-monitor` for automatic background behavior; a Codex plugin/skill does not run continuously by itself.
 - If the latest usage event is stale, use Codex once, then run `usage` again.
 - If the PC sleeps, the reminder fires after the machine wakes and the script resumes.
 - Scheduled reminders are allowed to run on battery power.
