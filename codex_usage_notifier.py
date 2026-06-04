@@ -306,6 +306,7 @@ def find_latest_codex_usage_by_account(log_db: Path = CODEX_LOG_DB, limit: int =
             from logs
             where (feedback_log_body like '%websocket event:%codex.rate_limits%'
                or feedback_log_body like '%websocket event:%usage_limit_reached%')
+              and target = 'codex_api::endpoint::responses_websocket'
               and feedback_log_body not like '%Received message%'
             order by id desc
             limit ?
@@ -455,6 +456,26 @@ def scheduled_python_executable() -> Path:
     return current
 
 
+def scheduled_task_has_future_run(task_name: str) -> bool:
+    ps_script = f"""
+$info = Get-ScheduledTaskInfo -TaskName {powershell_quote(task_name)} -ErrorAction SilentlyContinue
+if ($null -eq $info -or $null -eq $info.NextRunTime) {{
+  exit 1
+}}
+if ($info.NextRunTime -le (Get-Date)) {{
+  exit 1
+}}
+exit 0
+"""
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
 def sleep_until(target: datetime) -> None:
     while True:
         remaining = (target - datetime.now()).total_seconds()
@@ -588,7 +609,7 @@ $ErrorActionPreference = "Stop"
 $runAt = [datetime]::ParseExact({powershell_quote(reset_text)}, "yyyy-MM-dd HH:mm:ss", $null)
 $action = New-ScheduledTaskAction -Execute {powershell_quote(str(python_path))} -Argument {powershell_quote(task_args)}
 $trigger = New-ScheduledTaskTrigger -Once -At $runAt
-$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Compatibility Win8
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -WakeToRun -Compatibility Win8
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 Register-ScheduledTask -TaskName {powershell_quote(task_name)} -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description "Notify when Codex usage should be refreshed." -Force | Out-Null
 """
@@ -646,6 +667,7 @@ def monitor_single_usage(usage: dict[str, Any], args: argparse.Namespace) -> int
     already_scheduled = (
         account_state.get("task_name") == task_name
         and account_state.get("reset_at") == reset_text
+        and scheduled_task_has_future_run(task_name)
     )
     if already_scheduled:
         account_state.update(
@@ -722,7 +744,7 @@ def command_install_monitor(args: argparse.Namespace) -> int:
 $ErrorActionPreference = "Stop"
 $action = New-ScheduledTaskAction -Execute {powershell_quote(str(python_path))} -Argument {powershell_quote(task_args)}
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes {interval}) -RepetitionDuration (New-TimeSpan -Days 3650)
-$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Compatibility Win8
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -WakeToRun -Compatibility Win8
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
 Register-ScheduledTask -TaskName {powershell_quote(task_name)} -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description "Monitor local Codex app usage and schedule refresh notifications." -Force | Out-Null
 """
