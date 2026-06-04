@@ -446,6 +446,15 @@ def powershell_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def scheduled_python_executable() -> Path:
+    current = Path(sys.executable).resolve()
+    if current.name.lower() == "python.exe":
+        pythonw = current.with_name("pythonw.exe")
+        if pythonw.exists():
+            return pythonw
+    return current
+
+
 def sleep_until(target: datetime) -> None:
     while True:
         remaining = (target - datetime.now()).total_seconds()
@@ -568,7 +577,7 @@ def command_notify(args: argparse.Namespace) -> int:
 def command_schedule(args: argparse.Namespace) -> int:
     reset_at = parse_reset_time(args)
     script_path = Path(__file__).resolve()
-    python_path = Path(sys.executable).resolve()
+    python_path = scheduled_python_executable()
     reset_text = reset_at.strftime("%Y-%m-%d %H:%M:%S")
     task_name = args.task_name
     task_args = f'"{script_path}" notify --at "{reset_text}"'
@@ -697,7 +706,7 @@ def command_monitor_once(args: argparse.Namespace) -> int:
 
 def command_install_monitor(args: argparse.Namespace) -> int:
     script_path = Path(__file__).resolve()
-    python_path = Path(sys.executable).resolve()
+    python_path = scheduled_python_executable()
     task_name = args.task_name
     interval = max(1, int(args.interval_minutes))
     task_args = (
@@ -868,6 +877,7 @@ def main() -> int:
         print("Stopped.")
         return 130
     except Exception as exc:
+        log_event(f"error {type(exc).__name__}: {exc}")
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
