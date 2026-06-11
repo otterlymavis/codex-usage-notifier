@@ -67,6 +67,10 @@ def log_event(message: str) -> None:
         handle.write(f"{stamp} {message}\n")
 
 
+def no_window_flags() -> int:
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
+
 def default_config() -> dict[str, Any]:
     return {
         "email": {
@@ -380,6 +384,7 @@ $notify.Dispose()
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            creationflags=no_window_flags(),
         )
         log_event(f"tray_notification_exit={result.returncode}")
     except OSError:
@@ -398,6 +403,7 @@ $null = $shell.Popup({json.dumps(message)}, 30, {json.dumps(title)}, 64)
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            creationflags=no_window_flags(),
         )
         log_event(f"popup_notification_exit={result.returncode}")
     except OSError:
@@ -472,6 +478,7 @@ exit 0
         check=False,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        creationflags=no_window_flags(),
     )
     return result.returncode == 0
 
@@ -527,6 +534,7 @@ $info | Select-Object LastRunTime,LastTaskResult,NextRunTime,NumberOfMissedRuns 
     subprocess.run(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
         check=False,
+        creationflags=no_window_flags(),
     )
 
     if LOG_PATH.exists():
@@ -616,6 +624,7 @@ Register-ScheduledTask -TaskName {powershell_quote(task_name)} -Action $action -
     subprocess.run(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
         check=True,
+        creationflags=no_window_flags(),
     )
     save_json(
         STATE_PATH,
@@ -751,6 +760,7 @@ Register-ScheduledTask -TaskName {powershell_quote(task_name)} -Action $action -
     subprocess.run(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
         check=True,
+        creationflags=no_window_flags(),
     )
     log_event(f"monitor_installed task_name={task_name} interval_minutes={interval}")
     print(f"Installed monitor task '{task_name}' to check Codex usage every {interval} minute(s).")
@@ -774,6 +784,7 @@ def command_uninstall_monitor(args: argparse.Namespace) -> int:
                 f"Unregister-ScheduledTask -TaskName {powershell_quote(task_name)} -Confirm:$false -ErrorAction SilentlyContinue",
             ],
             check=False,
+            creationflags=no_window_flags(),
         )
         log_event(f"task_uninstalled_if_present task_name={task_name}")
     print("Removed monitor/reminder tasks if they existed.")
