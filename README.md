@@ -1,8 +1,8 @@
-# Codex Usage Notifier
+# Usage Refresh Notifier
 
-Small Windows-friendly notifier for Codex usage refreshes.
+Small Windows-friendly notifier for AI usage refreshes across Codex, Claude, Cursor, ChatGPT, Gemini, Poe, and similar tools.
 
-OpenAI's public Codex help page says Codex limits depend on your plan and that the current reset/options are shown in the Codex usage page or limit banner. It does not document a public API for personal Codex usage refreshes, so this first version works from the reset time Codex shows you.
+Codex has an automatic local-log provider. Other tools can use manual reminders from whatever reset time they show, such as "try again at 6:30 PM" or "resets in 5 hours."
 
 ## Quick Start
 
@@ -16,6 +16,24 @@ Send a test desktop notification:
 
 ```powershell
 python .\codex_usage_notifier.py test
+```
+
+List available providers:
+
+```powershell
+python .\codex_usage_notifier.py providers
+```
+
+Schedule a Claude reminder from a visible reset time:
+
+```powershell
+python .\codex_usage_notifier.py schedule-manual --provider claude --label "Claude Pro" --in "5h"
+```
+
+Or:
+
+```powershell
+python .\codex_usage_notifier.py schedule-manual --provider claude --label "Claude Pro" --at "18:30"
 ```
 
 Read the latest Codex app usage cached in local Codex logs:
@@ -105,7 +123,8 @@ Example email block:
 
 ## Notes
 
-- The reset time comes from Codex's own usage page or limit banner.
+- Codex reset times come from Codex's local app logs.
+- Claude and other services currently use manual reset times unless a stable local usage source is added.
 - `usage` and `schedule-from-app` read Codex's local app logs, not your OpenAI auth file.
 - This version does not scrape your OpenAI account or browser session.
 - Multi-account monitoring can only use accounts that appear in Codex's local app logs. If an account is stale, switch to that account in Codex and use Codex once so the app writes a fresh usage event.

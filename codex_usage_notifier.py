@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Notify when Codex usage should be refreshed.
+"""Notify when an AI service usage limit should be refreshed.
 
 Codex does not currently provide a public usage-refresh API for personal plan
 limits, so this tool works from the reset time shown in Codex's usage page or
@@ -49,7 +49,7 @@ class EmailConfig:
 def load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
     if not path.exists():
         return default
-    with path.open("r", encoding="utf-8") as handle:
+    with path.open("r", encoding="utf-8-sig") as handle:
         return json.load(handle)
 
 
@@ -58,6 +58,13 @@ def save_json(path: Path, data: dict[str, Any]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=2)
         handle.write("\n")
+
+
+def update_state(values: dict[str, Any]) -> dict[str, Any]:
+    state = load_json(STATE_PATH, {})
+    state.update(values)
+    save_json(STATE_PATH, state)
+    return state
 
 
 def log_event(message: str) -> None:
@@ -435,16 +442,26 @@ def send_email(config: EmailConfig, subject: str, body: str) -> None:
     log_event("email_sent")
 
 
-def notify_all(config: EmailConfig, reset_at: datetime, label: str | None = None) -> None:
+def notify_all(
+    config: EmailConfig,
+    reset_at: datetime,
+    label: str | None = None,
+    service_label: str = "Codex",
+) -> None:
     suffix = f" for {label}" if label else ""
-    subject = f"Codex usage should be refreshed{suffix}"
+    subject = f"{service_label} usage should be refreshed{suffix}"
     body = (
-        f"Codex usage should be refreshed now{suffix}.\n\n"
+        f"{service_label} usage should be refreshed now{suffix}.\n\n"
         f"Reset time: {reset_at.strftime('%Y-%m-%d %H:%M:%S')}\n"
     )
-    log_event(f"notify_start reset_at={reset_at.isoformat(timespec='seconds')} account={label or 'unknown'}")
-    desktop_notify(subject, f"Your Codex usage reset time has arrived{suffix}.")
-    popup_notify(subject, f"Your Codex usage reset time has arrived{suffix}.")
+    log_event(
+        "notify_start "
+        f"service={service_label} "
+        f"reset_at={reset_at.isoformat(timespec='seconds')} "
+        f"account={label or 'unknown'}"
+    )
+    desktop_notify(subject, f"Your {service_label} usage reset time has arrived{suffix}.")
+    popup_notify(subject, f"Your {service_label} usage reset time has arrived{suffix}.")
     send_email(config, subject, body)
     log_event("notify_complete")
 
@@ -504,7 +521,7 @@ def command_init(_: argparse.Namespace) -> int:
 def command_test(args: argparse.Namespace) -> int:
     config = parse_email_config(load_json(CONFIG_PATH, default_config()))
     reset_at = datetime.now()
-    notify_all(config, reset_at, args.account_label)
+    notify_all(config, reset_at, args.account_label, args.service_label)
     print("Sent test notification.")
     if config.enabled:
         print("Email was enabled; attempted to send test email.")
@@ -568,6 +585,62 @@ def command_usage(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_providers(args: argparse.Namespace) -> int:
+    providers = [
+        {
+            "name": "codex",
+            "mode": "automatic",
+            "source": str(CODEX_LOG_DB),
+            "notes": "Reads local Codex app rate-limit events.",
+        },
+        {
+            "name": "manual",
+            "mode": "manual",
+            "source": "user-provided reset time",
+            "notes": "Works for Claude, Cursor, ChatGPT, Gemini, Poe, or any service that shows a reset time.",
+        },
+        {
+            "name": "claude",
+            "mode": "manual",
+            "source": "user-provided reset time",
+            "notes": "Claude Code local files do not currently expose a stable Codex-style usage reset event here.",
+        },
+    ]
+    if args.json:
+        print(json.dumps(providers, indent=2))
+    else:
+        for provider in providers:
+            print(f"{provider['name']}: {provider['mode']} - {provider['notes']}")
+    return 0
+
+
+def command_schedule_manual(args: argparse.Namespace) -> int:
+    provider = args.provider.strip()
+    label = args.account_label or args.label or provider
+    task_base = args.task_name or f"{DEFAULT_TASK_NAME}_{provider}"
+    task_key = f"{provider}:{label}"
+    reset_at = parse_reset_time(args)
+    args.at = reset_at.strftime("%Y-%m-%d %H:%M:%S")
+    args.in_duration = None
+    args.task_name = f"{task_base}_{account_task_suffix(task_key)}"
+    args.service_label = args.service_label or provider.title()
+    args.account_label = label
+    result = command_schedule(args)
+
+    state = load_json(STATE_PATH, {})
+    manual = state.setdefault("manual_reminders", {})
+    manual[task_key] = {
+        "provider": provider,
+        "label": label,
+        "task_name": args.task_name,
+        "reset_at": reset_at.isoformat(timespec="seconds"),
+        "scheduled_at": datetime.now().isoformat(timespec="seconds"),
+        "service_label": args.service_label,
+    }
+    save_json(STATE_PATH, state)
+    return result
+
+
 def command_schedule_from_app(args: argparse.Namespace) -> int:
     usage = find_latest_codex_usage(Path(args.log_db) if args.log_db else CODEX_LOG_DB)
     rate_limits = usage.get("rate_limits") or {}
@@ -581,6 +654,7 @@ def command_schedule_from_app(args: argparse.Namespace) -> int:
     args.at = reset_at.strftime("%Y-%m-%d %H:%M:%S")
     args.in_duration = None
     args.account_label = account_label(usage)
+    args.service_label = "Codex"
     print(format_usage(usage))
     return command_schedule(args)
 
@@ -588,14 +662,14 @@ def command_schedule_from_app(args: argparse.Namespace) -> int:
 def command_notify(args: argparse.Namespace) -> int:
     config = parse_email_config(load_json(CONFIG_PATH, default_config()))
     reset_at = parse_reset_time(args) if args.at or args.in_duration else datetime.now()
-    notify_all(config, reset_at, args.account_label)
-    save_json(
-        STATE_PATH,
+    notify_all(config, reset_at, args.account_label, args.service_label)
+    update_state(
         {
             "reset_at": reset_at.isoformat(timespec="seconds"),
             "notified_at": datetime.now().isoformat(timespec="seconds"),
             "mode": "scheduled-task",
             "account_label": args.account_label,
+            "service_label": args.service_label,
         },
     )
     log_event("notify_command_completed")
@@ -612,6 +686,8 @@ def command_schedule(args: argparse.Namespace) -> int:
     task_args = f'"{script_path}" notify --at "{reset_text}"'
     if getattr(args, "account_label", None):
         task_args += f' --account-label "{args.account_label}"'
+    if getattr(args, "service_label", None):
+        task_args += f' --service-label "{args.service_label}"'
     ps_script = f"""
 $ErrorActionPreference = "Stop"
 $runAt = [datetime]::ParseExact({powershell_quote(reset_text)}, "yyyy-MM-dd HH:mm:ss", $null)
@@ -619,21 +695,21 @@ $action = New-ScheduledTaskAction -Execute {powershell_quote(str(python_path))} 
 $trigger = New-ScheduledTaskTrigger -Once -At $runAt
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -WakeToRun -Compatibility Win8
 $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
-Register-ScheduledTask -TaskName {powershell_quote(task_name)} -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description "Notify when Codex usage should be refreshed." -Force | Out-Null
+Register-ScheduledTask -TaskName {powershell_quote(task_name)} -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description "Notify when AI service usage should be refreshed." -Force | Out-Null
 """
     subprocess.run(
         ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
         check=True,
         creationflags=no_window_flags(),
     )
-    save_json(
-        STATE_PATH,
+    update_state(
         {
             "reset_at": reset_at.isoformat(timespec="seconds"),
             "scheduled_at": datetime.now().isoformat(timespec="seconds"),
             "task_name": task_name,
             "mode": "scheduled-task",
             "account_label": getattr(args, "account_label", None),
+            "service_label": getattr(args, "service_label", "Codex"),
         },
     )
     log_event(f"scheduled task_name={task_name} reset_at={reset_at.isoformat(timespec='seconds')}")
@@ -671,7 +747,7 @@ def monitor_single_usage(usage: dict[str, Any], args: argparse.Namespace) -> int
             f"previous_reset_at={previous_app_reset.isoformat(timespec='seconds')} "
             f"new_reset_at={reset_text}"
         )
-        notify_all(config, previous_app_reset, label)
+        notify_all(config, previous_app_reset, label, "Codex")
 
     already_scheduled = (
         account_state.get("task_name") == task_name
@@ -697,6 +773,7 @@ def monitor_single_usage(usage: dict[str, Any], args: argparse.Namespace) -> int
         in_duration=None,
         task_name=task_name,
         account_label=label,
+        service_label="Codex",
     )
     result = command_schedule(schedule_args)
     updated_state = load_json(STATE_PATH, {})
@@ -794,19 +871,17 @@ def command_uninstall_monitor(args: argparse.Namespace) -> int:
 def command_watch(args: argparse.Namespace) -> int:
     reset_at = parse_reset_time(args)
     config = parse_email_config(load_json(CONFIG_PATH, default_config()))
-    save_json(
-        STATE_PATH,
+    update_state(
         {
             "reset_at": reset_at.isoformat(timespec="seconds"),
             "started_at": datetime.now().isoformat(timespec="seconds"),
         },
     )
-    print(f"Watching Codex reset time: {reset_at.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Watching usage reset time: {reset_at.strftime('%Y-%m-%d %H:%M:%S')}")
     log_event(f"watch_started reset_at={reset_at.isoformat(timespec='seconds')}")
     sleep_until(reset_at)
     notify_all(config, reset_at)
-    save_json(
-        STATE_PATH,
+    update_state(
         {
             "reset_at": reset_at.isoformat(timespec="seconds"),
             "notified_at": datetime.now().isoformat(timespec="seconds"),
@@ -818,7 +893,7 @@ def command_watch(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Notify when Codex usage refreshes.")
+    parser = argparse.ArgumentParser(description="Notify when AI service usage refreshes.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     init_parser = subparsers.add_parser("init", help="Create the config file.")
@@ -826,6 +901,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     test_parser = subparsers.add_parser("test", help="Send a test notification.")
     test_parser.add_argument("--account-label", help="Optional account label to include in the test.")
+    test_parser.add_argument("--service-label", default="Codex", help="Service name to include in the test.")
     test_parser.set_defaults(func=command_test)
 
     status_parser = subparsers.add_parser("status", help="Show scheduled task and notifier state.")
@@ -841,6 +917,10 @@ def build_parser() -> argparse.ArgumentParser:
     usage_parser.add_argument("--all-accounts", action="store_true", help="Print latest usage for every account found in Codex logs.")
     usage_parser.add_argument("--log-db", help="Path to Codex logs_2.sqlite.")
     usage_parser.set_defaults(func=command_usage)
+
+    providers_parser = subparsers.add_parser("providers", help="List supported usage providers.")
+    providers_parser.add_argument("--json", action="store_true", help="Print provider metadata as JSON.")
+    providers_parser.set_defaults(func=command_providers)
 
     schedule_from_app_parser = subparsers.add_parser(
         "schedule-from-app",
@@ -884,6 +964,7 @@ def build_parser() -> argparse.ArgumentParser:
     notify_parser.add_argument("--at", help="Reset time to include in the notification.")
     notify_parser.add_argument("--in", dest="in_duration", help="Reset duration to include in the notification.")
     notify_parser.add_argument("--account-label", help="Optional account label to include in the notification.")
+    notify_parser.add_argument("--service-label", default="Codex", help="Service name to include in the notification.")
     notify_parser.set_defaults(func=command_notify)
 
     schedule_parser = subparsers.add_parser("schedule", help="Create a one-time Windows scheduled task.")
@@ -891,9 +972,23 @@ def build_parser() -> argparse.ArgumentParser:
     schedule_parser.add_argument("--in", dest="in_duration", help="Reset duration, e.g. '5h' or '4 days 3h'.")
     schedule_parser.add_argument("--task-name", default=DEFAULT_TASK_NAME, help="Windows scheduled task name.")
     schedule_parser.add_argument("--account-label", help="Optional account label to include in the notification.")
+    schedule_parser.add_argument("--service-label", default="Codex", help="Service name to include in the notification.")
     schedule_parser.set_defaults(func=command_schedule)
 
-    watch_parser = subparsers.add_parser("watch", help="Wait until a Codex reset time.")
+    schedule_manual_parser = subparsers.add_parser(
+        "schedule-manual",
+        help="Schedule a usage refresh reminder for Claude or any other service.",
+    )
+    schedule_manual_parser.add_argument("--provider", required=True, help="Provider name, e.g. claude, cursor, chatgpt.")
+    schedule_manual_parser.add_argument("--label", help="Human-readable account/workspace label.")
+    schedule_manual_parser.add_argument("--account-label", help="Optional account label to include in the notification.")
+    schedule_manual_parser.add_argument("--service-label", help="Service display name; defaults to provider title.")
+    schedule_manual_parser.add_argument("--at", help="Reset time, e.g. '2026-06-11 18:30' or '18:30'.")
+    schedule_manual_parser.add_argument("--in", dest="in_duration", help="Reset duration, e.g. '5h' or '4 days 3h'.")
+    schedule_manual_parser.add_argument("--task-name", help="Optional Windows scheduled task base name.")
+    schedule_manual_parser.set_defaults(func=command_schedule_manual)
+
+    watch_parser = subparsers.add_parser("watch", help="Wait until a usage reset time.")
     watch_parser.add_argument("--at", help="Reset time, e.g. '2026-05-29 18:30' or '18:30'.")
     watch_parser.add_argument("--in", dest="in_duration", help="Reset duration, e.g. '5h' or '4 days 3h'.")
     watch_parser.set_defaults(func=command_watch)
